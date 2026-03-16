@@ -1,71 +1,93 @@
 import pandas as pd
 
 
+DEFAULT_COLUMNS = [
+    "Tid (Time)",
+    "Energi",
+    "Peak High",
+    "Snittlast",
+    "Utetemperatur",
+]
+
 
 def clean_energy_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+    cleaned = df.copy()
+    cleaned.columns = _normalize_column_names(cleaned.columns)
+    cleaned = cleaned.rename(columns={"tid_time": "time", "coâ‚‚": "co2"})
+    cleaned = _clean_string_columns(cleaned)
+    cleaned = _parse_time_columns(cleaned)
+    cleaned = _convert_known_numeric_columns(cleaned)
+    return cleaned
 
-    # Clean column names
-    df.columns = (
-        df.columns
-        .str.strip()
-        .str.replace('"', '', regex=False)
+
+def _normalize_column_names(columns: pd.Index) -> pd.Index:
+    return (
+        columns.str.strip()
+        .str.replace('"', "", regex=False)
         .str.lower()
         .str.replace(" ", "_")
         .str.replace("(", "", regex=False)
         .str.replace(")", "", regex=False)
     )
 
-    # Rename special column names
-    rename_map = {
-        "tid_time": "time",
-        "co₂": "co2",
-    }
-    df = df.rename(columns=rename_map)
 
-    # Clean all object/string cells
-    obj_cols = df.select_dtypes(include="object").columns
-    for col in obj_cols:
-        df[col] = (
-            df[col]
+def _clean_string_columns(df: pd.DataFrame) -> pd.DataFrame:
+    object_columns = df.select_dtypes(include="object").columns
+
+    for column_name in object_columns:
+        df[column_name] = (
+            df[column_name]
             .astype(str)
             .str.strip()
-            .str.replace('"', '', regex=False)
+            .str.replace('"', "", regex=False)
         )
-        df[col] = df[col].replace({"": pd.NA, "nan": pd.NA})
+        df[column_name] = df[column_name].replace({"": pd.NA, "nan": pd.NA})
 
-    # Parse time interval column
-    if "time" in df.columns:
-        parts = df["time"].str.split(" - ", expand=True)
+    return df
 
-        df["start_time"] = pd.to_datetime(
-            parts[0],
-            format="%d.%m.%Y %H:%M",
-            errors="coerce"
+
+def _parse_time_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if "time" not in df.columns:
+        return df
+
+    time_parts = df["time"].str.split(" - ", expand=True)
+    df["start_time"] = pd.to_datetime(
+        time_parts[0],
+        format="%d.%m.%Y %H:%M",
+        errors="coerce",
+    )
+    df["end_time"] = pd.to_datetime(
+        df["start_time"].dt.strftime("%d.%m.%Y") + " " + time_parts[1],
+        format="%d.%m.%Y %H:%M",
+        errors="coerce",
+    )
+
+    crosses_midnight = df["end_time"] < df["start_time"]
+    df.loc[crosses_midnight, "end_time"] = df.loc[crosses_midnight, "end_time"] + pd.Timedelta(days=1)
+    return df
+
+
+def _convert_known_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    numeric_columns = [
+        "energi",
+        "co2",
+        "kostnad",
+        "peak_high",
+        "snittlast",
+        "utetemperatur",
+    ]
+
+    for column_name in numeric_columns:
+        if column_name not in df.columns:
+            continue
+
+        normalized = (
+            df[column_name]
+            .astype(str)
+            .str.replace(",", ".", regex=False)
+            .replace({"<NA>": pd.NA, "nan": pd.NA})
         )
-
-        df["end_time"] = pd.to_datetime(
-            df["start_time"].dt.strftime("%d.%m.%Y") + " " + parts[1],
-            format="%d.%m.%Y %H:%M",
-            errors="coerce"
-        )
-
-        # Handle intervals crossing midnight
-        mask = df["end_time"] < df["start_time"]
-        df.loc[mask, "end_time"] = df.loc[mask, "end_time"] + pd.Timedelta(days=1)
-
-    # Convert numeric columns with comma decimals
-    numeric_cols = ["energi", "co2", "kostnad", "peak_high", "snittlast", "utetemperatur"]
-
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = (
-                df[col]
-                .astype(str)
-                .str.replace(",", ".", regex=False)
-                .replace({"<NA>": pd.NA, "nan": pd.NA})
-            )
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[column_name] = pd.to_numeric(normalized, errors="coerce")
 
     return df
 
@@ -75,87 +97,99 @@ def clean_numeric_columns_auto(
     allow_negative: list[str] | None = None,
     exclude_cols: list[str] | None = None,
     min_numeric_ratio: float = 0.8,
-    interpolate: bool = True
+    interpolate: bool = True,
 ) -> pd.DataFrame:
-    df = df.copy()
+    cleaned = df.copy()
+    allowed_negative_columns = allow_negative or []
+    excluded_columns = exclude_cols or []
 
-    if allow_negative is None:
-        allow_negative = []
-
-    if exclude_cols is None:
-        exclude_cols = []
-
-    detected_numeric_cols = []
-
-    for col in df.columns:
-        if col in exclude_cols:
+    detected_numeric_columns = []
+    for column_name in cleaned.columns:
+        if column_name in excluded_columns:
             continue
 
-        # Already numeric
-        if pd.api.types.is_numeric_dtype(df[col]):
-            detected_numeric_cols.append(col)
+        if pd.api.types.is_numeric_dtype(cleaned[column_name]):
+            detected_numeric_columns.append(column_name)
             continue
 
-        # Try converting string/object columns to numeric
-        cleaned = (
-            df[col]
-            .astype(str)
-            .str.strip()
-            .replace({"": pd.NA, "nan": pd.NA, "<NA>": pd.NA})
-            .str.replace(",", ".", regex=False)
-        )
+        converted = _try_convert_series_to_numeric(cleaned[column_name])
+        if _is_mostly_numeric(cleaned[column_name], converted, min_numeric_ratio):
+            cleaned[column_name] = converted
+            detected_numeric_columns.append(column_name)
 
-        converted = pd.to_numeric(cleaned, errors="coerce")
+    _replace_invalid_negative_values(cleaned, detected_numeric_columns, allowed_negative_columns)
 
-        # Count as numeric if enough values convert successfully
-        non_missing_original = cleaned.notna().sum()
-        non_missing_converted = converted.notna().sum()
-
-        ratio = (
-            non_missing_converted / non_missing_original
-            if non_missing_original > 0 else 0
-        )
-
-        if ratio >= min_numeric_ratio:
-            df[col] = converted
-            detected_numeric_cols.append(col)
-
-    # Remove invalid negative values
-    for col in detected_numeric_cols:
-        if col not in allow_negative:
-            df.loc[df[col] < 0, col] = pd.NA
-
-    # Interpolate missing values
-    if interpolate and detected_numeric_cols:
-        df[detected_numeric_cols] = df[detected_numeric_cols].interpolate(
+    if interpolate and detected_numeric_columns:
+        cleaned[detected_numeric_columns] = cleaned[detected_numeric_columns].interpolate(
             method="linear",
-            limit_direction="both"
+            limit_direction="both",
         )
 
-    return df
+    return cleaned
 
 
-def fetch_and_clean_df(meter_id: str, 
-             sampletime: str,
-             columns = ["Tid (Time)", "Energi", "Peak High","Snittlast", "Utetemperatur"]
-             ) -> pd.DataFrame: 
-    # File path
+def _try_convert_series_to_numeric(series: pd.Series) -> pd.Series:
+    normalized = (
+        series.astype(str)
+        .str.strip()
+        .replace({"": pd.NA, "nan": pd.NA, "<NA>": pd.NA})
+        .str.replace(",", ".", regex=False)
+    )
+    return pd.to_numeric(normalized, errors="coerce")
+
+
+def _is_mostly_numeric(
+    original_series: pd.Series,
+    converted_series: pd.Series,
+    min_numeric_ratio: float,
+) -> bool:
+    normalized_original = (
+        original_series.astype(str)
+        .str.strip()
+        .replace({"": pd.NA, "nan": pd.NA, "<NA>": pd.NA})
+    )
+
+    original_non_missing = normalized_original.notna().sum()
+    converted_non_missing = converted_series.notna().sum()
+
+    if original_non_missing == 0:
+        return False
+
+    return (converted_non_missing / original_non_missing) >= min_numeric_ratio
+
+
+def _replace_invalid_negative_values(
+    df: pd.DataFrame,
+    numeric_columns: list[str],
+    allowed_negative_columns: list[str],
+) -> None:
+    for column_name in numeric_columns:
+        if column_name in allowed_negative_columns:
+            continue
+        df.loc[df[column_name] < 0, column_name] = pd.NA
+
+
+def fetch_and_clean_df(
+    meter_id: str,
+    sampletime: str,
+    columns: list[str] | None = None,
+) -> pd.DataFrame:
+    selected_columns = columns or DEFAULT_COLUMNS
     filename = f"data/{meter_id}_{sampletime}.csv"
-    num_lines_metadata = 3
 
-    df = pd.read_csv(
+    raw = pd.read_csv(
         filename,
         sep=";",
         decimal=",",
         quotechar='"',
         na_values=["", '""'],
-        skiprows=num_lines_metadata)
-    
-    df_clean = clean_numeric_columns_auto(
-        df[columns],
+        skiprows=3,
+    )
+
+    cleaned = clean_numeric_columns_auto(
+        raw[selected_columns],
         allow_negative=["Utetemperatur"],
         min_numeric_ratio=0.8,
-        interpolate=True
+        interpolate=True,
     )
-    
-    return df_clean[columns].copy()
+    return cleaned[selected_columns].copy()

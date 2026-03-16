@@ -1,14 +1,12 @@
+from typing import Any
+
 import numpy as np
-from statsmodels.tsa.seasonal import MSTL
-from sklearn.linear_model import HuberRegressor
 import pandas as pd
+from sklearn.linear_model import HuberRegressor
+from statsmodels.tsa.seasonal import MSTL
 
-def mstl_decomposition(
-    series: np.ndarray,
-    periods: list[int]
-) -> dict[int | str, np.ndarray]:
 
-    # Error checks
+def mstl_decomposition(series: np.ndarray, periods: list[int]) -> dict[int | str, np.ndarray]:
     if series.ndim != 1:
         raise ValueError("series must be 1D")
     if not periods:
@@ -16,150 +14,170 @@ def mstl_decomposition(
     if np.isnan(series).any():
         raise ValueError("series contains NaNs; clean/interpolate missing data before MSTL")
 
-    mstl = MSTL(
+    model = MSTL(
         series,
         periods=tuple(periods),
         stl_kwargs={"robust": True},
     )
-    res = mstl.fit()
+    result = model.fit()
 
-
-    decomposition_results: dict[int | str, np.ndarray] = {}
-
-    seasonal = np.asarray(res.seasonal)
+    decomposition: dict[int | str, np.ndarray] = {}
+    seasonal = np.asarray(result.seasonal)
 
     if seasonal.ndim == 1:
-        decomposition_results[mstl.periods[0]] = seasonal
+        decomposition[model.periods[0]] = seasonal
     else:
-        for i, period in enumerate(mstl.periods):
-            decomposition_results[period] = seasonal[:, i]
+        for column_index, period in enumerate(model.periods):
+            decomposition[period] = seasonal[:, column_index]
 
-    decomposition_results["res"] = np.asarray(res.resid)
-    decomposition_results["trend"] = np.asarray(res.trend)  
+    decomposition["res"] = np.asarray(result.resid)
+    decomposition["trend"] = np.asarray(result.trend)
+    return decomposition
 
-    return decomposition_results
 
-def ewma(x: np.ndarray, alpha: float = 0.2) -> np.ndarray:
-    """ exponential weighted moving average """
-    y = np.empty_like(x, dtype=float)
-    y[0] = x[0]
-    for i in range(1, len(x)):
-        y[i] = alpha * x[i] + (1 - alpha) * y[i-1]
-    return y
+def ewma(values: np.ndarray, alpha: float = 0.2) -> np.ndarray:
+    """Simple exponential moving average used for temperature smoothing."""
+    smoothed = np.empty_like(values, dtype=float)
+    smoothed[0] = values[0]
 
-def T_smooth_and_HDH(T: np.ndarray, T_b: float = 18.0) -> tuple[np.ndarray, np.ndarray]:
-    T_smooth = ewma(T, alpha=0.2)  # ~5–10h memory; tune if you want
-    HDH = np.maximum(0.0, T_b - T_smooth)  # heating degree "hours" (Δ°C = ΔK)
-    return T_smooth, HDH
+    for index in range(1, len(values)):
+        smoothed[index] = alpha * values[index] + (1 - alpha) * smoothed[index - 1]
 
-def estimate_P_temp_huber(T: np.ndarray, P_star: np.ndarray) -> dict[str, Any]:
-    T_smooth, HDH = T_smooth_and_HDH(T)
+    return smoothed
 
-    mask = np.isfinite(P_star) & np.isfinite(HDH)
-    X = HDH[mask].reshape(-1, 1)
-    y = P_star[mask]
 
-    model = HuberRegressor().fit(X, y)
+def T_smooth_and_HDH(temperature: np.ndarray, T_b: float = 18.0) -> tuple[np.ndarray, np.ndarray]:
+    smoothed_temperature = ewma(temperature, alpha=0.2)
+    heating_degree_hours = np.maximum(0.0, T_b - smoothed_temperature)
+    return smoothed_temperature, heating_degree_hours
 
-    beta = float(model.coef_[0])
 
-    P_temp = np.zeros_like(P_star, dtype=float)
-    P_temp[mask] = beta * HDH[mask]
-    P_temp = np.maximum(0.0, P_temp)
+def estimate_P_temp_huber(temperature: np.ndarray, baseline_adjusted_power: np.ndarray) -> dict[str, Any]:
+    smoothed_temperature, heating_degree_hours = T_smooth_and_HDH(temperature)
 
-    print(beta)
+    valid_mask = np.isfinite(baseline_adjusted_power) & np.isfinite(heating_degree_hours)
+    regression_input = heating_degree_hours[valid_mask].reshape(-1, 1)
+    regression_target = baseline_adjusted_power[valid_mask]
+
+    model = HuberRegressor().fit(regression_input, regression_target)
+    temperature_sensitivity = float(model.coef_[0])
+
+    estimated_temperature_power = np.zeros_like(baseline_adjusted_power, dtype=float)
+    estimated_temperature_power[valid_mask] = (
+        temperature_sensitivity * heating_degree_hours[valid_mask]
+    )
+    estimated_temperature_power = np.maximum(0.0, estimated_temperature_power)
+
     return {
-        "P_temp": P_temp,
+        "P_temp": estimated_temperature_power,
         "model": model,
-        "beta": beta,
-        "HDH": HDH,
-        "mask": mask,
-        "T_smooth": T_smooth,
+        "beta": temperature_sensitivity,
+        "HDH": heating_degree_hours,
+        "mask": valid_mask,
+        "T_smooth": smoothed_temperature,
     }
 
+
 def upper_bound_P_star_hour_of_week(
-    P: np.ndarray,
-    T_out: np.ndarray,
+    power: np.ndarray,
+    outdoor_temperature: np.ndarray,
     *,
     T_b: float = 18.0,
     q_low: float = 0.1,
-    offset_how: int = 0,          # shift if your series doesn't start at Mon 00:00
+    offset_how: int = 0,
     min_warm_samples_per_slot: int = 10,
 ) -> dict[str, np.ndarray]:
     """
-    Upper bound on P_star by using a low (q_low) baseline per hour-of-week,
-    estimated from warm hours (T_out >= T_b) when heating should be minimal.
-
-    Returns dict with:
-      - P_base_low: baseline (same length as P)
-      - P_star_ub:  optimistic leftover P - P_base_low
-      - slot_baseline: length-168 baseline values
+    Estimate an optimistic upper bound for weather-driven load by first building
+    a low baseline for each hour of the week.
     """
-    P = np.asarray(P, dtype=float)
-    T_out = np.asarray(T_out, dtype=float)
+    power = np.asarray(power, dtype=float)
+    outdoor_temperature = np.asarray(outdoor_temperature, dtype=float)
 
-    if P.ndim != 1 or T_out.ndim != 1 or P.shape != T_out.shape:
+    if power.ndim != 1 or outdoor_temperature.ndim != 1 or power.shape != outdoor_temperature.shape:
         raise ValueError("P and T_out must be 1D arrays with the same shape")
     if not (0.0 < q_low < 1.0):
         raise ValueError("q_low must be in (0, 1)")
 
-    n = P.size
-    idx = np.arange(n)
-    how = (idx + offset_how) % 168
-
-    valid = np.isfinite(P) & np.isfinite(T_out)
-    warm = valid & (T_out >= T_b)
+    hour_of_week = (np.arange(power.size) + offset_how) % 168
+    valid_mask = np.isfinite(power) & np.isfinite(outdoor_temperature)
+    warm_mask = valid_mask & (outdoor_temperature >= T_b)
 
     slot_baseline = np.full(168, np.nan)
+    for slot in range(168):
+        slot_baseline[slot] = _estimate_slot_baseline(
+            power=power,
+            hour_of_week=hour_of_week,
+            slot=slot,
+            warm_mask=warm_mask,
+            valid_mask=valid_mask,
+            q_low=q_low,
+            min_warm_samples_per_slot=min_warm_samples_per_slot,
+        )
 
-    for s in range(168):
-        m = warm & (how == s)
-        if m.sum() >= min_warm_samples_per_slot:
-            slot_baseline[s] = float(np.nanquantile(P[m], q_low))
-        else:
-            # fallback: use all valid samples for that slot if warm hours are scarce
-            m2 = valid & (how == s)
-            if m2.sum() >= 5:
-                slot_baseline[s] = float(np.nanquantile(P[m2], q_low))
-            else:
-                slot_baseline[s] = np.nan
-
-    P_base_low = slot_baseline[how]
-    P_star_ub = P - P_base_low
+    baseline_by_hour = slot_baseline[hour_of_week]
+    optimistic_residual = power - baseline_by_hour
 
     return {
-        "P_base_low": P_base_low,
-        "P_star_ub": P_star_ub,
+        "P_base_low": baseline_by_hour,
+        "P_star_ub": optimistic_residual,
         "slot_baseline": slot_baseline,
     }
 
 
+def _estimate_slot_baseline(
+    *,
+    power: np.ndarray,
+    hour_of_week: np.ndarray,
+    slot: int,
+    warm_mask: np.ndarray,
+    valid_mask: np.ndarray,
+    q_low: float,
+    min_warm_samples_per_slot: int,
+) -> float:
+    warm_samples_in_slot = warm_mask & (hour_of_week == slot)
+    if warm_samples_in_slot.sum() >= min_warm_samples_per_slot:
+        return float(np.nanquantile(power[warm_samples_in_slot], q_low))
+
+    valid_samples_in_slot = valid_mask & (hour_of_week == slot)
+    if valid_samples_in_slot.sum() >= 5:
+        return float(np.nanquantile(power[valid_samples_in_slot], q_low))
+
+    return np.nan
+
+
 def upper_bound_P_temp_from_P_star(
-    P_star_ub: np.ndarray,
-    T_out: np.ndarray,
+    optimistic_residual: np.ndarray,
+    outdoor_temperature: np.ndarray,
     *,
     T_b: float = 18.0,
     warm_q: float = 0.2,
 ) -> np.ndarray:
     """
-    Optimistic upper bound on temperature-dependent power:
-    - subtract a warm-hour baseline from P_star_ub
-    - count only cold hours
+    Turn the optimistic residual into an optimistic temperature-dependent load by
+    removing a warm-hour baseline and keeping only cold-hour load above that level.
     """
-    P_star_ub = np.asarray(P_star_ub, dtype=float)
-    T_out = np.asarray(T_out, dtype=float)
-    if P_star_ub.shape != T_out.shape:
+    optimistic_residual = np.asarray(optimistic_residual, dtype=float)
+    outdoor_temperature = np.asarray(outdoor_temperature, dtype=float)
+
+    if optimistic_residual.shape != outdoor_temperature.shape:
         raise ValueError("P_star_ub and T_out must have same shape")
 
-    valid = np.isfinite(P_star_ub) & np.isfinite(T_out)
-    warm = valid & (T_out >= T_b)
-    cold = valid & (T_out < T_b)
+    valid_mask = np.isfinite(optimistic_residual) & np.isfinite(outdoor_temperature)
+    warm_mask = valid_mask & (outdoor_temperature >= T_b)
+    cold_mask = valid_mask & (outdoor_temperature < T_b)
 
-    baseline = 0.0 if warm.sum() < 10 else float(np.nanquantile(P_star_ub[warm], warm_q))
+    warm_baseline = 0.0
+    if warm_mask.sum() >= 10:
+        warm_baseline = float(np.nanquantile(optimistic_residual[warm_mask], warm_q))
 
-    P_temp_ub = np.zeros_like(P_star_ub, dtype=float)
-    P_temp_ub[cold] = np.maximum(0.0, P_star_ub[cold] - baseline)
-    return P_temp_ub
+    optimistic_temperature_power = np.zeros_like(optimistic_residual, dtype=float)
+    optimistic_temperature_power[cold_mask] = np.maximum(
+        0.0,
+        optimistic_residual[cold_mask] - warm_baseline,
+    )
+    return optimistic_temperature_power
+
 
 def peak_share_attribution(
     total: pd.Series,
@@ -169,66 +187,44 @@ def peak_share_attribution(
     *,
     min_peak_count: int = 24,
 ) -> dict[str, object]:
-    """
-    total: building total power (kW avg, ideally)
-    sensors: dict of submeter power series (kW avg)
-    peak_ref: series used to define peak hours (can be P_peak or P_avg)
-    q: quantile threshold (e.g. 0.99)
-    """
+    aligned = _build_aligned_meter_frame(total, peak_ref, sensors)
 
-    # Align everything to common index
-    df = pd.DataFrame({"total": total, "peak_ref": peak_ref})
-    for name, s in sensors.items():
-        df[name] = s
-    df = df.sort_index()
+    peak_threshold = aligned["peak_ref"].quantile(q)
+    peak_mask = aligned["peak_ref"] >= peak_threshold
+    peak_count = int(peak_mask.sum())
 
-    # Valid rows
-    valid = df[["total", "peak_ref"]].notna().all(axis=1)
-    for name in sensors:
-        valid &= df[name].notna()
-    df = df.loc[valid].copy()
+    if peak_count < min_peak_count:
+        return {
+            "error": f"Too few peak hours: {peak_count}",
+            "peak_threshold": float(peak_threshold),
+            "n_peak": peak_count,
+        }
 
-    thr = df["peak_ref"].quantile(q)
-    peak_mask = df["peak_ref"] >= thr
-    n_peak = int(peak_mask.sum())
-    if n_peak < min_peak_count:
-        return {"error": f"Too few peak hours: {n_peak}", "peak_threshold": float(thr), "n_peak": n_peak}
-
-    # Shares per hour
-    shares = pd.DataFrame(index=df.index)
-    for name in sensors:
-        shares[name] = (df[name] / df["total"]).clip(lower=0.0)
-
-    shares["known_sum"] = shares[list(sensors.keys())].sum(axis=1)
-    shares["other"] = (1.0 - shares["known_sum"]).clip(lower=0.0)
-
-    # Summary over peak hours
+    shares = _calculate_hourly_shares(aligned, list(sensors.keys()))
     peak_shares = shares.loc[peak_mask]
-    summary = pd.DataFrame({
-        "mean_share": peak_shares.mean(),
-        "median_share": peak_shares.median(),
-        "p95_share": peak_shares.quantile(0.95),
-    }).sort_values("mean_share", ascending=False)
+    share_summary = pd.DataFrame(
+        {
+            "mean_share": peak_shares.mean(),
+            "median_share": peak_shares.median(),
+            "p95_share": peak_shares.quantile(0.95),
+        }
+    ).sort_values("mean_share", ascending=False)
 
-    # Energy-weighted share (often better than plain mean)
-    energy_weighted = {}
-    denom = df.loc[peak_mask, "total"].sum()
-    for name in list(sensors.keys()) + ["other"]:
-        if name == "other":
-            # other power = total - sum sensors
-            other_power = (df["total"] - df[list(sensors.keys())].sum(axis=1)).clip(lower=0.0)
-            energy_weighted[name] = float(other_power.loc[peak_mask].sum() / (denom + 1e-12))
-        else:
-            energy_weighted[name] = float(df.loc[peak_mask, name].sum() / (denom + 1e-12))
+    energy_weighted_share = _calculate_energy_weighted_share(
+        aligned=aligned,
+        peak_mask=peak_mask,
+        sensor_names=list(sensors.keys()),
+    )
 
     return {
-        "peak_threshold": float(thr),
-        "n_peak": n_peak,
-        "summary_peak_shares": summary,
-        "energy_weighted_peak_share": energy_weighted,
-        "peak_hours_index": df.index[peak_mask],
+        "peak_threshold": float(peak_threshold),
+        "n_peak": peak_count,
+        "summary_peak_shares": share_summary,
+        "energy_weighted_peak_share": energy_weighted_share,
+        "peak_hours_index": aligned.index[peak_mask],
         "shares_peak_hours": peak_shares,
     }
+
 
 def peak_times_meter_info(
     P_total_avg: pd.Series,
@@ -239,98 +235,143 @@ def peak_times_meter_info(
     min_peak_count: int = 24,
 ) -> dict[str, Any]:
     """
-    Summarize other meters during peak hours defined by P_peak_ref >= quantile(q).
-
-    Parameters
-    ----------
-    P_total_avg : pd.Series
-        Total building hourly average kW (main meter). Used for shares.
-    P_peak_ref : pd.Series
-        Series used to define peak hours (can be Peak High or Snittlast).
-    other_avg : dict[str, pd.Series]
-        Dict of other meters' hourly average kW series.
-    q : float
-        Peak quantile threshold.
-    min_peak_count : int
-        Require at least this many peak hours.
-
-    Returns
-    -------
-    dict with:
-      - peak_threshold, n_peak, peak_hours
-      - stats_peak: DataFrame with mean/median/p95 per meter during peak hours
-      - share_peak: DataFrame with energy-weighted shares during peak hours
-      - coverage: fraction of timestamps kept after alignment
+    Summarize how each submeter behaves during hours where the reference peak
+    signal is above the chosen quantile threshold.
     """
     if not (0.0 < q < 1.0):
         raise ValueError("q must be in (0, 1)")
 
-    # Align everything by timestamp
-    df = pd.DataFrame({"total": P_total_avg, "peak_ref": P_peak_ref})
-    for name, s in other_avg.items():
-        df[name] = s
+    aligned = _build_aligned_meter_frame(P_total_avg, P_peak_ref, other_avg)
+    coverage = float(len(aligned)) / float(len(P_peak_ref.dropna()))
 
-    df = df.replace([np.inf, -np.inf], np.nan)
-    df = df.dropna(how="any").sort_index()
+    peak_threshold = float(aligned["peak_ref"].quantile(q))
+    peak_mask = aligned["peak_ref"] >= peak_threshold
+    peak_count = int(peak_mask.sum())
 
-    if df.empty:
-        raise ValueError("No overlapping data after alignment.")
-
-    thr = float(df["peak_ref"].quantile(q))
-    peak_mask = df["peak_ref"] >= thr
-    n_peak = int(peak_mask.sum())
-
-    if n_peak < min_peak_count:
+    if peak_count < min_peak_count:
         return {
-            "peak_threshold": thr,
-            "n_peak": n_peak,
-            "peak_hours": df.index[peak_mask],
+            "peak_threshold": peak_threshold,
+            "n_peak": peak_count,
+            "peak_hours": aligned.index[peak_mask],
             "stats_peak": None,
             "share_peak": None,
-            "coverage": float(len(df)) / float(len(P_peak_ref.dropna())),
-            "error": f"Too few peak hours for q={q} (n_peak={n_peak})",
+            "coverage": coverage,
+            "error": f"Too few peak hours for q={q} (n_peak={peak_count})",
         }
 
-    # Stats per meter during peak hours
-    rows = []
-    for name in other_avg.keys():
-        x = df.loc[peak_mask, name].to_numpy(dtype=float)
-        rows.append({
-            "meter": name,
-            "mean_kW": float(np.mean(x)),
-            "median_kW": float(np.median(x)),
-            "p95_kW": float(np.percentile(x, 95)),
-            "max_kW": float(np.max(x)),
-        })
-
-    stats_peak = pd.DataFrame(rows).set_index("meter").sort_values("mean_kW", ascending=False)
-
-    # Energy-weighted share during peak hours
-    denom = float(df.loc[peak_mask, "total"].sum())
-    share_rows = []
-    known_sum = df.loc[peak_mask, list(other_avg.keys())].sum(axis=1)
-    other_power = (df.loc[peak_mask, "total"] - known_sum).clip(lower=0.0)
-
-    for name in other_avg.keys():
-        share_rows.append({
-            "meter": name,
-            "energy_weighted_share": float(df.loc[peak_mask, name].sum() / (denom + 1e-12)),
-        })
-
-    share_rows.append({
-        "meter": "UNACCOUNTED_OTHER",
-        "energy_weighted_share": float(other_power.sum() / (denom + 1e-12)),
-    })
-
-    share_peak = pd.DataFrame(share_rows).set_index("meter").sort_values(
-        "energy_weighted_share", ascending=False
-    )
+    stats_peak = _summarize_peak_meter_stats(aligned, peak_mask, list(other_avg.keys()))
+    share_peak = _summarize_peak_meter_shares(aligned, peak_mask, list(other_avg.keys()))
 
     return {
-        "peak_threshold": thr,
-        "n_peak": n_peak,
-        "peak_hours": df.index[peak_mask],
+        "peak_threshold": peak_threshold,
+        "n_peak": peak_count,
+        "peak_hours": aligned.index[peak_mask],
         "stats_peak": stats_peak,
         "share_peak": share_peak,
-        "coverage": float(len(df)) / float(len(P_peak_ref.dropna())),
+        "coverage": coverage,
     }
+
+
+def _build_aligned_meter_frame(
+    total: pd.Series,
+    peak_ref: pd.Series,
+    sensors: dict[str, pd.Series],
+) -> pd.DataFrame:
+    frame = pd.DataFrame({"total": total, "peak_ref": peak_ref})
+    for sensor_name, sensor_series in sensors.items():
+        frame[sensor_name] = sensor_series
+
+    frame = frame.replace([np.inf, -np.inf], np.nan)
+    frame = frame.dropna(how="any").sort_index()
+
+    if frame.empty:
+        raise ValueError("No overlapping data after alignment.")
+
+    return frame
+
+
+def _calculate_hourly_shares(aligned: pd.DataFrame, sensor_names: list[str]) -> pd.DataFrame:
+    shares = pd.DataFrame(index=aligned.index)
+
+    for sensor_name in sensor_names:
+        shares[sensor_name] = (aligned[sensor_name] / aligned["total"]).clip(lower=0.0)
+
+    shares["known_sum"] = shares[sensor_names].sum(axis=1)
+    shares["other"] = (1.0 - shares["known_sum"]).clip(lower=0.0)
+    return shares
+
+
+def _calculate_energy_weighted_share(
+    *,
+    aligned: pd.DataFrame,
+    peak_mask: pd.Series,
+    sensor_names: list[str],
+) -> dict[str, float]:
+    denominator = aligned.loc[peak_mask, "total"].sum()
+    energy_weighted_share: dict[str, float] = {}
+
+    for sensor_name in sensor_names:
+        energy_weighted_share[sensor_name] = float(
+            aligned.loc[peak_mask, sensor_name].sum() / (denominator + 1e-12)
+        )
+
+    other_power = (aligned["total"] - aligned[sensor_names].sum(axis=1)).clip(lower=0.0)
+    energy_weighted_share["other"] = float(
+        other_power.loc[peak_mask].sum() / (denominator + 1e-12)
+    )
+    return energy_weighted_share
+
+
+def _summarize_peak_meter_stats(
+    aligned: pd.DataFrame,
+    peak_mask: pd.Series,
+    sensor_names: list[str],
+) -> pd.DataFrame:
+    rows = []
+
+    for sensor_name in sensor_names:
+        sensor_values = aligned.loc[peak_mask, sensor_name].to_numpy(dtype=float)
+        rows.append(
+            {
+                "meter": sensor_name,
+                "mean_kW": float(np.mean(sensor_values)),
+                "median_kW": float(np.median(sensor_values)),
+                "p95_kW": float(np.percentile(sensor_values, 95)),
+                "max_kW": float(np.max(sensor_values)),
+            }
+        )
+
+    return pd.DataFrame(rows).set_index("meter").sort_values("mean_kW", ascending=False)
+
+
+def _summarize_peak_meter_shares(
+    aligned: pd.DataFrame,
+    peak_mask: pd.Series,
+    sensor_names: list[str],
+) -> pd.DataFrame:
+    denominator = float(aligned.loc[peak_mask, "total"].sum())
+    rows = []
+
+    for sensor_name in sensor_names:
+        rows.append(
+            {
+                "meter": sensor_name,
+                "energy_weighted_share": float(
+                    aligned.loc[peak_mask, sensor_name].sum() / (denominator + 1e-12)
+                ),
+            }
+        )
+
+    known_sum = aligned.loc[peak_mask, sensor_names].sum(axis=1)
+    unaccounted_other = (aligned.loc[peak_mask, "total"] - known_sum).clip(lower=0.0)
+    rows.append(
+        {
+            "meter": "UNACCOUNTED_OTHER",
+            "energy_weighted_share": float(unaccounted_other.sum() / (denominator + 1e-12)),
+        }
+    )
+
+    return pd.DataFrame(rows).set_index("meter").sort_values(
+        "energy_weighted_share",
+        ascending=False,
+    )
