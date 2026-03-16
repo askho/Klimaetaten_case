@@ -1,168 +1,141 @@
 import pandas as pd
 import numpy as np
-from statsmodels.tsa.seasonal import STL
+from fetch_and_clean_data import fetch_and_clean_df
+from utils import mstl_decomposition, estimate_P_temp_huber, upper_bound_P_star_hour_of_week, upper_bound_P_temp_from_P_star, peak_times_meter_info
+from scoring import calc_flex_score, grid_search_temperature_flex_score
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 import matplotlib.dates as mdates
+from plotting  import plot_flex_diagnostics
 
-from decomp_cache import decompose_mstl_cached
+from EV_charging_score import compare_ev_peaks
 
-
-def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-
-    # Coerce to numeric
-    for c in ["year", "day", "hour"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["VOLUME_KWH"] = pd.to_numeric(df["VOLUME_KWH"], errors="coerce")
-
-    # Drop invalid
-    df = df.dropna(subset=["year", "day", "hour", "VOLUME_KWH"])
-    df["year"] = df["year"].astype(int)
-    df["day"] = df["day"].astype(int)
-    df["hour"] = df["hour"].astype(int)
-
-    df = df[df["day"].between(1, 366) & df["hour"].between(0, 23)]
-
-    # Only group if duplicates exist
-    if df.duplicated(["year", "day", "hour"]).any():
-        df = df.groupby(["year", "day", "hour"], as_index=False)["VOLUME_KWH"].mean()
-
-    # Build timestamp index safely
-    base = pd.to_datetime(df["year"].astype(str), format="%Y", errors="coerce")
-    df["time"] = base + pd.to_timedelta(df["day"] - 1, unit="D") + pd.to_timedelta(df["hour"], unit="h")
-    df = df.dropna(subset=["time"]).sort_values("time").set_index("time")
-
-    # Enforce hourly grid (IMPORTANT: pandas wants "h", not "H" in your setup)
-    df = df.asfreq("h")
-
-    # Fill missing values
-    df["VOLUME_KWH"] = df["VOLUME_KWH"].interpolate("time")
-
-    return df
+meters = {"hoved" : "EL_hovedmåler_4089_rest",
+          "brytehall" : "EL_brytehall_og_garderober",
+          "vent_1" : "EL_ventilasjon_Hall2",
+          "vent_2" : "EL_ventilasjon_kontor_garderober",
+          "vent_3" : "EL_ventilasjon_treningsrom"
+          }
+periods_hourly_array = {"daily" : 24, "weekly": 24*7}
+periods_daily_array = {"weekly": 7}
 
 
-def decompose_time_series_two_stage(df: pd.DataFrame):
-    """
-    Robust + fast alternative to MSTL:
-    1) STL daily (24)
-    2) STL weekly (168) on remainder after removing daily seasonal
-    Returns arrays: trend, seasonal_day, seasonal_week, resid
-    """
-    y = df["VOLUME_KWH"].sort_index().asfreq("h").interpolate("time")
-
-    if len(y) < 200:  # guardrail
-        raise ValueError(f"Time series too short for STL: len(y)={len(y)}. Check cleaning/indexing.")
-
-    # Daily
-    r_day = STL(y, period=24, robust=True).fit()
-    y_minus_day = y - r_day.seasonal
-
-    # Weekly on remainder
-    r_week = STL(y_minus_day, period=168, robust=True).fit()
-
-    seasonal_day = r_day.seasonal.to_numpy()
-    seasonal_week = r_week.seasonal.to_numpy()
-    trend = r_week.trend.to_numpy()
-    resid = r_week.resid.to_numpy()
-
-    return trend, seasonal_day, seasonal_week, resid
-
-
-def add_stacked_to_existing_axes(ax, df, trend, seasonal_day, seasonal_week, i0=0, i1=None):
-    y = df["VOLUME_KWH"].sort_index().asfreq("h")
-
-    if i1 is None:
-        i1 = len(y)
-
-    y = y.iloc[i0:i1]
-
-    trend_s = pd.Series(np.asarray(trend)[i0:i1], index=y.index, dtype=float)
-    day_s = pd.Series(np.asarray(seasonal_day)[i0:i1], index=y.index, dtype=float)
-    week_s = pd.Series(np.asarray(seasonal_week)[i0:i1], index=y.index, dtype=float)
-
-    x = y.index
-    # Convert datetime index to matplotlib date numbers for reliable fill_between
-    x_num = mdates.date2num(pd.to_datetime(x).to_pydatetime())
-
-    c1 = trend_s.values
-    c2 = (trend_s + day_s).values
-    c3 = (trend_s + day_s + week_s).values
-
-    # Original line
-    ax.plot(x_num, y.values, label="Original", alpha=0.5, zorder=3)
-
-    # Stacked fills
-    ax.fill_between(x_num, 0, c1, label="Trend", alpha=0.25, zorder=1)
-    ax.fill_between(x_num, c1, c2, label="Daily seasonal", alpha=0.25, zorder=1)
-    ax.fill_between(x_num, c2, c3, label="Weekly seasonal", alpha=0.25, zorder=1)
-
-    # Year-only ticks
-    ax.xaxis.set_major_locator(mdates.YearLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.set_xlim(x_num[0], x_num[-1])
-
-    return ax
-
-def add_daily_weekly_only(ax, df, seasonal_day, seasonal_week, i0=0, i1=None, plot_original=True):
-    """
-    Adds ONLY daily + weekly seasonal components as stacked fills to an existing Axes.
-    - Does NOT call plt.show()
-    - x-limits controlled by i0/i1 (integer iloc slice into df)
-    - Year-only x ticks
-    """
-    y = df["VOLUME_KWH"].sort_index().asfreq("h")
-
-    if i1 is None:
-        i1 = len(y)
-
-    y = y.iloc[i0:i1]
-
-    day_s  = pd.Series(np.asarray(seasonal_day)[i0:i1], index=y.index, dtype=float)
-    week_s = pd.Series(np.asarray(seasonal_week)[i0:i1], index=y.index, dtype=float)
-
-    x = y.index
-    x_num = mdates.date2num(pd.to_datetime(x).to_pydatetime())
-
-    c1 = day_s.values
-    c2 = (day_s + week_s).values
-
-    if plot_original:
-        ax.plot(x_num, y.values, label="Original", alpha=0.5, zorder=3)
-
-    ax.fill_between(x_num, 0,  c1, label="Daily seasonal", alpha=0.25, zorder=1)
-    ax.fill_between(x_num, c1, c2, label="Weekly seasonal", alpha=0.25, zorder=1)
-
-    ax.xaxis.set_major_locator(mdates.YearLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
-    ax.set_xlim(x_num[0], x_num[-1])
-
-    return ax
-
-def main():
-    df = pd.read_csv("processed_data.csv")
-    # df = clean_data(df)
-
-    # Build your hourly series (make sure df is indexed by time before this)
-    y = df["VOLUME_KWH"]
-    # If you already have df indexed by time, great.
-    # Otherwise: y needs a DatetimeIndex, not year/day/hour columns.
-
-    seasonal, trend, resid, meta = decompose_mstl_cached(
-        y,
-        periods=[24, 168],
-        cache_dir="cache",
+def set_time_index_from_tid(df: pd.DataFrame, col: str = "Tid (Time)") -> pd.DataFrame:
+    # 1) extract start timestamp ("DD.MM.YYYY HH:MM") from "DD.MM.YYYY HH:MM - HH:MM"
+    start = (
+        df[col]
+        .astype(str)
+        .str.strip()
+        .str.split(" - ", n=1, expand=True)[0]
+        .str.strip()
     )
 
-    seasonal_day = seasonal[:, 0]
-    seasonal_week = seasonal[:, 1]
+    # 2) parse using explicit format (fast + reliable)
+    dt = pd.to_datetime(start, format="%d.%m.%Y %H:%M", errors="coerce")
 
-    print("Loaded/computed MSTL:", meta)
+    # fallback if any weird rows
+    if dt.isna().any():
+        dt2 = pd.to_datetime(start, dayfirst=True, errors="coerce")
+        dt = dt.fillna(dt2)
 
-    # Plot example
-    plt.figure(figsize=(12, 6))
-    plt.plot(y.index, y.values, alpha=0.5, label="Original")
-    plt.legend()
-    plt.show()
+    out = df.copy()
+    out["timestamp"] = dt
+    out = out.dropna(subset=["timestamp"]).set_index("timestamp").sort_index()
 
-if __name__ == "__main__":
+    # (optional) ensure hourly frequency is consistent
+    out = out[~out.index.duplicated(keep="first")]
+    return out
+
+def build_other_meters_kW_avg_dict(meters: dict[str, str]) -> dict[str, pd.Series]:
+    ids = [meters[key] for key in meters if key != "hoved"]
+    out: dict[str, pd.Series] = {}
+
+    for meter_id in ids:
+        df = fetch_and_clean_df(meter_id, "time", columns=["Snittlast"])  # <- not [["Snittlast"]]
+        out[meter_id] = df["Snittlast"].astype(float)  # <- keep as Series with datetime index
+
+    return out
+
+# ---------------- MAIN ----------------
+def main() -> None:
+    id = meters["hoved"]
+    df_main = fetch_and_clean_df(id, "time")
+    
+    P_avg_s  = df_main["Snittlast"].astype(float)
+    P_peak_s = df_main["Peak High"].astype(float)
+    T_out_s  = df_main["Utetemperatur"].astype(float)
+
+    # NP arrays for MSTL
+    P_avg = P_avg_s.to_numpy()
+    P_peak = P_peak_s.to_numpy()
+    T = T_out_s.to_numpy()
+
+    # MSTL decomp to isolate hourly and weekly seasonality
+    avg_decomp = mstl_decomposition(P_avg, periods=[24, 24 * 7])
+    P_star = P_avg - avg_decomp[24] - avg_decomp[24 * 7]  # = trend + residual (schedule removed)
+
+    # Best-estimate P_temp
+    P_temp = estimate_P_temp_huber(T, P_star)["P_temp"]
+
+    # Optimistic upper-bound branch 
+    ub_star = upper_bound_P_star_hour_of_week(P_avg, T, T_b=18.0, q_low=0.1)
+    P_star_ub = ub_star["P_star_ub"]
+    P_temp_ub = upper_bound_P_temp_from_P_star(P_star_ub, T, T_b=18.0, warm_q=0.2)
+
+    # Grid search to find max score combos
+    q_grid = [0.90, 0.95, 0.97, 0.99]
+    f_grid = [0.2, 0.3, 0.4, 0.5, 0.6]
+    k_scale_grid = [5.0, 10.0, 20.0, 40.0]
+
+    out_est = grid_search_temperature_flex_score(P_peak, P_temp, q_grid, f_grid, k_scale_grid, min_peak_count=48)
+    out_ub  = grid_search_temperature_flex_score(P_peak, P_temp_ub, q_grid, f_grid, k_scale_grid, min_peak_count=48)
+
+    # Print best scores for Huber and Optimistic
+    print("\n=== BEST-ESTIMATE (Huber) ===")
+    score_est = out_est["best_overall"]
+    for k, v in score_est.items():
+        print(f"{k}: {v}")
+
+    print("\n=== UPPER-BOUND (Optimistic) ===")
+    score_ub = out_ub["best_overall"]
+    for k, v in score_ub.items():
+        print(f"{k}: {v}")
+
+    ## main meter series for diagostics on how other submeters behave during main meter peaks
+    P_avg_other = build_other_meters_kW_avg_dict(meters)
+    P_total_avg = df_main["Snittlast"].astype(float)
+    P_peak_ref = df_main["Peak High"].astype(float)  # peak definition
+
+    info = peak_times_meter_info(P_total_avg, P_peak_ref, P_avg_other, q=0.99, min_peak_count=24)
+
+    print("peak_threshold:", info["peak_threshold"])
+    print("n_peak:", info["n_peak"])
+    print("\n--- Peak-hour meter stats (kW) ---")
+    print(info["stats_peak"])
+    print("\n--- Peak-hour energy-weighted shares ---")
+    print(info["share_peak"])
+
+    ## Plotting diagnostics
+    # Convert outputs back to Series (for plotting)
+
+    # Other meters as Series
+    P_avg_other = build_other_meters_kW_avg_dict(meters)
+
+
+    # --- plotting ---
+    plot_flex_diagnostics(
+        df_main=df_main,
+        P_avg=P_avg,
+        P_peak=P_peak,
+        T_out=T,
+        P_star=P_star,
+        P_temp=P_temp,
+        other_avg=P_avg_other,   # can be dict[str, Series] OR dict[str, np.ndarray]
+        q=0.99,
+        top_n_peaks=48,
+        periods=[("2025-01-10", "2025-01-17"), ("2025-07-10", "2025-07-17")],
+        show=True,
+    )
+
+if __name__ == '__main__':
     main()
